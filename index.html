@@ -1,0 +1,691 @@
+import React, { useMemo, useState } from 'react';
+
+/**
+ * GoComet - US Import Tariff Calculator
+ * Fixes in this revision:
+ * - Replaced `catch {}` with `catch (err) {}` for ES2015- compatibility.
+ * - Removed stray, corrupted code after `fmtPct` that caused a syntax error.
+ * - Corrected JSX closing tags around the results section (removed extra braces/sections).
+ * - Kept existing tests and added more lightweight console.assert tests.
+ */
+
+const WEBHOOK_URL = 'https://n8n.product-internal.gocomet.com/webhook-test/6dc1904d-24c5-4c08-a042-882af95440cb';
+const REQUEST_TIMEOUT_MS = 90000; // 90s
+const UPSTREAM_WEBHOOK = WEBHOOK_URL; // cross-origin upstream
+const DEFAULT_PROXY_ENDPOINT = '/api/tariff'; // same-origin proxy endpoint
+
+// --- Local SVG Icons (no external deps) ---
+function IconChevronDown({ className = '' }) {
+  return (
+    <svg
+      className={className}
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      role="presentation"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <polyline points="6 9 12 15 18 9" />
+    </svg>
+  );
+}
+
+function IconLoader({ className = '' }) {
+  return (
+    <svg
+      className={className}
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      role="presentation"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <line x1="12" y1="2" x2="12" y2="6" />
+      <line x1="12" y1="18" x2="12" y2="22" />
+      <line x1="4.93" y1="4.93" x2="7.76" y2="7.76" />
+      <line x1="16.24" y1="16.24" x2="19.07" y2="19.07" />
+      <line x1="2" y1="12" x2="6" y2="12" />
+      <line x1="18" y1="12" x2="22" y2="12" />
+      <line x1="4.93" y1="19.07" x2="7.76" y2="16.24" />
+      <line x1="16.24" y1="7.76" x2="19.07" y2="4.93" />
+    </svg>
+  );
+}
+
+// --- Helpers ---
+function normalizeHts(input) {
+  if (!input) return '';
+  const digits = String(input).replace(/\D/g, '').slice(0, 10);
+  return digits;
+}
+
+function formatHtsDotted(digits10) {
+  if (!/^\d{10}$/.test(digits10)) return '';
+  return `${digits10.slice(0, 4)}.${digits10.slice(4, 6)}.${digits10.slice(6, 8)}.${digits10.slice(8, 10)}`;
+}
+
+// --- Parsing & formatting helpers for results ---
+function parsePercent(s) {
+  if (s == null) return 0;
+  const m = String(s).match(/-?\d+(?:\.\d+)?/);
+  return m ? parseFloat(m[0]) : 0;
+}
+function parseMoney(s) {
+  if (s == null) return 0;
+  const n = parseFloat(String(s).replace(/[^0-9.-]/g, ''));
+  return isNaN(n) ? 0 : n;
+}
+const fmtUSD = (n) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(Number(n || 0));
+const fmtPct = (n) => `${Number(n || 0).toFixed(2)}%`;
+
+// --- Dev-time assertions (simple tests) ---
+if (typeof window !== 'undefined') {
+  try {
+    console.assert(normalizeHts('0102.39.00.54') === '0102390054', 'normalizeHts dotted failed');
+    console.assert(normalizeHts('0102390054') === '0102390054', 'normalizeHts plain failed');
+    console.assert(formatHtsDotted('0102390054') === '0102.39.00.54', 'formatHtsDotted failed');
+    // more tests (added)
+    console.assert(normalizeHts(' 0102-39-00-54 ') === '0102390054', 'normalizeHts punctuation failed');
+    console.assert(normalizeHts('0102390054999') === '0102390054', 'normalizeHts length cap failed');
+    console.assert(formatHtsDotted('1234567890') === '1234.56.78.90', 'formatHtsDotted pattern failed');
+    // additional tests
+    console.assert(normalizeHts('') === '', 'normalizeHts empty failed');
+    console.assert(normalizeHts('abc') === '', 'normalizeHts nondigits failed');
+    console.assert(formatHtsDotted('0000000000') === '0000.00.00.00', 'formatHtsDotted zeros failed');
+    console.assert(formatHtsDotted('123456789') === '', 'formatHtsDotted short input should be empty');
+    // parsing helpers tests
+    console.assert(parsePercent('5%') === 5, 'parsePercent with % failed');
+    console.assert(parsePercent('2.75 percent') === 2.75, 'parsePercent decimal failed');
+    console.assert(parseMoney('$1,234.56') === 1234.56, 'parseMoney currency failed');
+    console.assert(fmtPct(3.5) === '3.50%', 'fmtPct formatting failed');
+  } catch (err) { /* no-op */ }
+}
+
+// --- Country list (from user) ---
+const countries = [
+  { name: 'Afghanistan', flag: '🇦🇫' },
+  { name: 'Albania', flag: '🇦🇱' },
+  { name: 'Algeria', flag: '🇩🇿' },
+  { name: 'Andorra', flag: '🇦🇩' },
+  { name: 'Angola', flag: '🇦🇴' },
+  { name: 'Anguilla', flag: '🇦🇮' },
+  { name: 'Antigua and Barbuda', flag: '🇦🇬' },
+  { name: 'Argentina', flag: '🇦🇷' },
+  { name: 'Armenia', flag: '🇦🇲' },
+  { name: 'Aruba', flag: '🇦🇼' },
+  { name: 'Australia', flag: '🇦🇺' },
+  { name: 'Azerbaijan', flag: '🇦🇿' },
+  { name: 'Bahamas', flag: '🇧🇸' },
+  { name: 'Bahrain', flag: '🇧🇭' },
+  { name: 'Bangladesh', flag: '🇧🇩' },
+  { name: 'Barbados', flag: '🇧🇧' },
+  { name: 'Belize', flag: '🇧🇿' },
+  { name: 'Benin', flag: '🇧🇯' },
+  { name: 'Bermuda', flag: '🇧🇲' },
+  { name: 'Bhutan', flag: '🇧🇹' },
+  { name: 'Bolivia', flag: '🇧🇴' },
+  { name: 'Bosnia and Herzegovina', flag: '🇧🇦' },
+  { name: 'Botswana', flag: '🇧🇼' },
+  { name: 'Brazil', flag: '🇧🇷' },
+  { name: 'British Indian Ocean Territory', flag: '🇮🇴' },
+  { name: 'British Virgin Islands', flag: '🇻🇬' },
+  { name: 'Brunei', flag: '🇧🇳' },
+  { name: 'Burundi', flag: '🇧🇮' },
+  { name: 'Cabo Verde', flag: '🇨🇻' },
+  { name: 'Cambodia', flag: '🇰🇭' },
+  { name: 'Cameroon', flag: '🇨🇲' },
+  { name: 'Cayman Islands', flag: '🇰🇾' },
+  { name: 'Central African Republic', flag: '🇨🇫' },
+  { name: 'Chad', flag: '🇹🇩' },
+  { name: 'Chile', flag: '🇨🇱' },
+  { name: 'China', flag: '🇨🇳' },
+  { name: 'Christmas Island', flag: '🇨🇽' },
+  { name: 'Cocos (Keeling) Islands', flag: '🇨🇨' },
+  { name: 'Colombia', flag: '🇨🇴' },
+  { name: 'Comoros', flag: '🇰🇲' },
+  { name: 'Cook Islands', flag: '🇨🇰' },
+  { name: 'Costa Rica', flag: '🇨🇷' },
+  { name: 'Côte d\u2019Ivoire', flag: '🇨🇮' },
+  { name: 'Curaçao', flag: '🇨🇼' },
+  { name: 'Democratic Republic of the Congo', flag: '🇨🇩' },
+  { name: 'Djibouti', flag: '🇩🇯' },
+  { name: 'Dominica', flag: '🇩🇲' },
+  { name: 'Dominican Republic', flag: '🇩🇴' },
+  { name: 'Ecuador', flag: '🇪🇨' },
+  { name: 'Egypt', flag: '🇪🇬' },
+  { name: 'El Salvador', flag: '🇸🇻' },
+  { name: 'Equatorial Guinea', flag: '🇬🇶' },
+  { name: 'Eritrea', flag: '🇪🇷' },
+  { name: 'Eswatini', flag: '🇸🇿' },
+  { name: 'Ethiopia', flag: '🇪🇹' },
+  { name: 'European Union', flag: '🇪🇺' },
+  { name: 'Falkland Islands', flag: '🇫🇰' },
+  { name: 'Fiji', flag: '🇫🇯' },
+  { name: 'Finland', flag: '🇫🇮' },
+  { name: 'French Guiana', flag: '🇬🇫' },
+  { name: 'French Polynesia', flag: '🇵🇫' },
+  { name: 'Gabon', flag: '🇬🇦' },
+  { name: 'Gambia', flag: '🇬🇲' },
+  { name: 'Georgia', flag: '🇬🇪' },
+  { name: 'Ghana', flag: '🇬🇭' },
+  { name: 'Gibraltar', flag: '🇬🇮' },
+  { name: 'Grenada', flag: '🇬🇩' },
+  { name: 'Guadeloupe', flag: '🇬🇵' },
+  { name: 'Guatemala', flag: '🇬🇹' },
+  { name: 'Guinea', flag: '🇬🇳' },
+  { name: 'Guinea-Bissau', flag: '🇬🇼' },
+  { name: 'Guyana', flag: '🇬🇾' },
+  { name: 'Haiti', flag: '🇭🇹' },
+  { name: 'Heard and McDonald Islands', flag: '🇭🇲' },
+  { name: 'Honduras', flag: '🇭🇳' },
+  { name: 'Iceland', flag: '🇮🇸' },
+  { name: 'India', flag: '🇮🇳' },
+  { name: 'Indonesia', flag: '🇮🇩' },
+  { name: 'Iran', flag: '🇮🇷' },
+  { name: 'Iraq', flag: '🇮🇶' },
+  { name: 'Israel', flag: '🇮🇱' },
+  { name: 'Jamaica', flag: '🇯🇲' },
+  { name: 'Japan', flag: '🇯🇵' },
+  { name: 'Jordan', flag: '🇯🇴' },
+  { name: 'Kazakhstan', flag: '🇰🇿' },
+  { name: 'Kenya', flag: '🇰🇪' },
+  { name: 'Kiribati', flag: '🇰🇮' },
+  { name: 'Kosovo', flag: '🇽🇰' },
+  { name: 'Kuwait', flag: '🇰🇼' },
+  { name: 'Kyrgyzstan', flag: '🇰🇬' },
+  { name: 'Laos', flag: '🇱🇦' },
+  { name: 'Lebanon', flag: '🇱🇧' },
+  { name: 'Lesotho', flag: '🇱🇸' },
+  { name: 'Liberia', flag: '🇱🇷' },
+  { name: 'Libya', flag: '🇱🇾' },
+  { name: 'Liechtenstein', flag: '🇱🇮' },
+  { name: 'Madagascar', flag: '🇲🇬' },
+  { name: 'Malawi', flag: '🇲🇼' },
+  { name: 'Malaysia', flag: '🇲🇾' },
+  { name: 'Maldives', flag: '🇲🇻' },
+  { name: 'Mali', flag: '🇲🇱' },
+  { name: 'Marshall Islands', flag: '🇲🇭' },
+  { name: 'Martinique', flag: '🇲🇶' },
+  { name: 'Mauritania', flag: '🇲🇷' },
+  { name: 'Mauritius', flag: '🇲🇺' },
+  { name: 'Mayotte', flag: '🇾🇹' },
+  { name: 'Micronesia', flag: '🇫🇲' },
+  { name: 'Moldova', flag: '🇲🇩' },
+  { name: 'Monaco', flag: '🇲🇨' },
+  { name: 'Mongolia', flag: '🇲🇳' },
+  { name: 'Montenegro', flag: '🇲🇪' },
+  { name: 'Montserrat', flag: '🇲🇸' },
+  { name: 'Morocco', flag: '🇲🇦' },
+  { name: 'Mozambique', flag: '🇲🇿' },
+  { name: 'Myanmar', flag: '🇲🇲' },
+  { name: 'Namibia', flag: '🇳🇦' },
+  { name: 'Nauru', flag: '🇳🇷' },
+  { name: 'Nepal', flag: '🇳🇵' },
+  { name: 'New Zealand', flag: '🇳🇿' },
+  { name: 'Nicaragua', flag: '🇳🇮' },
+  { name: 'Niger', flag: '🇳🇪' },
+  { name: 'Nigeria', flag: '🇳🇬' },
+  { name: 'Norfolk Island', flag: '🇳🇫' },
+  { name: 'North Macedonia', flag: '🇲🇰' },
+  { name: 'Norway', flag: '🇳🇴' },
+  { name: 'Oman', flag: '🇴🇲' },
+  { name: 'Pakistan', flag: '🇵🇰' },
+  { name: 'Panama', flag: '🇵🇦' },
+  { name: 'Papua New Guinea', flag: '🇵🇬' },
+  { name: 'Paraguay', flag: '🇵🇾' },
+  { name: 'Peru', flag: '🇵🇪' },
+  { name: 'Philippines', flag: '🇵🇭' },
+  { name: 'Qatar', flag: '🇶🇦' },
+  { name: 'Republic of the Congo', flag: '🇨🇬' },
+  { name: 'Reunion', flag: '🇷🇪' },
+  { name: 'Rwanda', flag: '🇷🇼' },
+  { name: 'Saint Helena', flag: '🇸🇭' },
+  { name: 'Saint Kitts and Nevis', flag: '🇰🇳' },
+  { name: 'Saint Lucia', flag: '🇱🇨' },
+  { name: 'Saint Pierre and Miquelon', flag: '🇵🇲' },
+  { name: 'Saint Vincent and the Grenadines', flag: '🇻🇨' },
+  { name: 'Samoa', flag: '🇼🇸' },
+  { name: 'San Marino', flag: '🇸🇲' },
+  { name: 'São Tomé and Príncipe', flag: '🇸🇹' },
+  { name: 'Saudi Arabia', flag: '🇸🇦' },
+  { name: 'Senegal', flag: '🇸🇳' },
+  { name: 'Serbia', flag: '🇷🇸' },
+  { name: 'Sierra Leone', flag: '🇸🇱' },
+  { name: 'Singapore', flag: '🇸🇬' },
+  { name: 'Sint Maarten', flag: '🇸🇽' },
+  { name: 'Solomon Islands', flag: '🇸🇧' },
+  { name: 'South Africa', flag: '🇿🇦' },
+  { name: 'South Korea', flag: '🇰🇷' },
+  { name: 'South Sudan', flag: '🇸🇸' },
+  { name: 'Sri Lanka', flag: '🇱🇰' },
+  { name: 'Sudan', flag: '🇸🇩' },
+  { name: 'Suriname', flag: '🇸🇷' },
+  { name: 'Svalbard and Jan Mayen', flag: '🇸🇯' },
+  { name: 'Switzerland', flag: '🇨🇭' },
+  { name: 'Syria', flag: '🇸🇾' },
+  { name: 'Taiwan', flag: '🇹🇼' },
+  { name: 'Tajikistan', flag: '🇹🇯' },
+  { name: 'Tanzania', flag: '🇹🇿' },
+  { name: 'Thailand', flag: '🇹🇭' },
+  { name: 'Timor-Leste', flag: '🇹🇱' },
+  { name: 'Togo', flag: '🇹🇬' },
+  { name: 'Tokelau', flag: '🇹🇰' },
+  { name: 'Tonga', flag: '🇹🇴' },
+  { name: 'Trinidad and Tobago', flag: '🇹🇹' },
+  { name: 'Tunisia', flag: '🇹🇳' },
+  { name: 'Turkey', flag: '🇹🇷' },
+  { name: 'Turkmenistan', flag: '🇹🇲' },
+  { name: 'Turks and Caicos Islands', flag: '🇹🇨' },
+  { name: 'Tuvalu', flag: '🇹🇻' },
+  { name: 'Uganda', flag: '🇺🇬' },
+  { name: 'Ukraine', flag: '🇺🇦' },
+  { name: 'United Arab Emirates', flag: '🇦🇪' },
+  { name: 'United Kingdom', flag: '🇬🇧' },
+  { name: 'Uruguay', flag: '🇺🇾' },
+  { name: 'Uzbekistan', flag: '🇺🇿' },
+  { name: 'Vanuatu', flag: '🇻🇺' },
+  { name: 'Venezuela', flag: '🇻🇪' },
+  { name: 'Vietnam', flag: '🇻🇳' },
+  { name: 'Yemen', flag: '🇾🇪' },
+  { name: 'Zambia', flag: '🇿🇲' },
+  { name: 'Zimbabwe', flag: '🇿🇼' },
+];
+
+// --- FAQs ---
+const faqs = [
+  {
+    question: 'What is an HTS Code?',
+    answer: 'A 10-digit US classification used to determine duties. Format can be dotted (0000.00.00.00) or 10 continuous digits.'
+  },
+  {
+    question: 'Which inputs affect duties?',
+    answer: 'HTS code, country of origin, date of entry, shipment value, and special programs (e.g., Section 301, 232, IEEPA, 201).'
+  },
+  {
+    question: 'Why might my request fail to send?',
+    answer: 'If the webhook origin lacks CORS headers, the browser will block the request. Use the Debug button to run diagnostics and check the console.'
+  },
+  {
+    question: 'What will I see in results?',
+    answer: 'A breakdown returned by the engine (e.g., base rate, reciprocal/retaliatory duties) rendered as key/value cards.'
+  }
+];
+
+export default function GocometTariffCalculator() {
+  const [formData, setFormData] = useState({
+    htsCode: '',
+    countryOfOrigin: 'China',
+    dateOfEntry: '',
+    shipmentValue: ''
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [openFaq, setOpenFaq] = useState(null);
+  const [error, setError] = useState(null);
+  const [submitInfo, setSubmitInfo] = useState(null);
+  const [results, setResults] = useState(null);
+  const [diag, setDiag] = useState(null); // visible diagnostics
+  const [simpleMode, setSimpleMode] = useState(false); // optional simple request (text/plain) to test preflight avoidance
+  const [useProxy, setUseProxy] = useState(true); // prefer same-origin proxy by default
+  const [endpoint, setEndpoint] = useState(() => {
+    try { return localStorage.getItem('tariff_endpoint') || DEFAULT_PROXY_ENDPOINT; } catch (err) { return DEFAULT_PROXY_ENDPOINT; }
+  });
+
+  const today = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const htsDigits = useMemo(() => normalizeHts(formData.htsCode), [formData.htsCode]);
+  const htsPretty = useMemo(() => formatHtsDotted(htsDigits), [htsDigits]);
+
+  const handleInputChange = (e) => {
+    const { name, value } = e.target;
+    setError(null); setSubmitInfo(null); setResults(null);
+    setFormData((prev) => ({ ...prev, [name]: value }));
+  };
+
+  function validate() {
+    if (!htsDigits || htsDigits.length !== 10) return 'Please enter a valid 10-digit HTS (e.g., 0102390054 or 0102.39.00.54).';
+    if (!formData.countryOfOrigin) return 'Please select a country of origin.';
+    if (!formData.dateOfEntry) return 'Please choose a date of entry.';
+    if (formData.dateOfEntry > today) return 'Date of entry cannot be in the future.';
+    const val = Number(formData.shipmentValue);
+    if (!(val > 0)) return 'Shipment value must be greater than 0.';
+    return null;
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError(null); setSubmitInfo(null); setResults(null);
+
+    const err = validate();
+    if (err) { setError(err); return; }
+    setIsSubmitting(true);
+
+    const payload = [{
+      '10 Digit HTS CODE': htsDigits,
+      'Country of Origin ': formData.countryOfOrigin,
+      'Date Of entry': formData.dateOfEntry,
+      'Shipment value': Number(formData.shipmentValue),
+      submittedAt: new Date().toISOString(),
+      formMode: 'webform'
+    }];
+
+    console.info('[TariffCalculator] POST payload →', payload);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const fetchInit = simpleMode
+        ? { method: 'POST', mode: 'cors', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(payload), signal: controller.signal, referrerPolicy: 'no-referrer' }
+        : { method: 'POST', mode: 'cors', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }, body: JSON.stringify(payload), signal: controller.signal, referrerPolicy: 'no-referrer' };
+
+      const res = await fetch(endpoint, fetchInit);
+      clearTimeout(timeout);
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(text || `Webhook error (HTTP ${res.status})`);
+        }
+
+      const txt = await res.text();
+      let data; try { data = txt ? JSON.parse(txt) : []; } catch (err) { data = txt ? [{ Raw: txt }] : []; }
+
+      if (!Array.isArray(data) || data.length === 0) {
+        setSubmitInfo({ type: 'success', message: 'Submitted. No rows returned.' });
+      } else {
+        setResults(data);
+        setSubmitInfo({ type: 'success', message: 'Tariff calculation completed.' });
+      }
+    } catch (err2) {
+      let msg = 'Unable to reach the webhook. ';
+      if (err2?.name === 'AbortError') msg += 'Request timed out.';
+      else if (String(err2).includes('Failed to fetch') || String(err2).includes('NetworkError')) msg += 'Possible CORS block on the server or network issue.';
+      else msg += String(err2.message || err2);
+      setError(msg + ' Use the Debug button below for details.');
+      console.error('[TariffCalculator] fetch error →', err2);
+    } finally {
+      setIsSubmitting(false);
+      clearTimeout(timeout);
+    }
+  }
+
+  async function runDiagnostics() {
+    const out = { origin: window.location.origin, url: endpoint, upstream: UPSTREAM_WEBHOOK, time: new Date().toISOString() };
+
+    try {
+      const r = await fetch(endpoint, { method: 'GET', mode: 'cors' });
+      out.getStatus = `${r.status}`; out.getACAO = r.headers?.get?.('access-control-allow-origin') || null;
+    } catch (e) { out.getError = String(e); }
+
+    try {
+      const r2 = await fetch(endpoint, { method: 'POST', mode: 'cors', headers: { 'Content-Type': 'text/plain' }, body: 'ping' });
+      out.postSimpleStatus = `${r2.status}`; out.postSimpleACAO = r2.headers?.get?.('access-control-allow-origin') || null;
+    } catch (e2) { out.postSimpleError = String(e2); }
+
+    try {
+      const r3 = await fetch(endpoint, { method: 'POST', mode: 'cors', headers: { 'Content-Type': 'application/json' }, body: '[{"diag":"preflight"}]' });
+      out.postJsonStatus = `${r3.status}`; out.postJsonACAO = r3.headers?.get?.('access-control-allow-origin') || null;
+    } catch (e3) { out.postJsonError = String(e3); }
+
+    out.curl = `curl -X POST '${UPSTREAM_WEBHOOK}' \
+  -H 'Content-Type: application/json' \
+  --data '[{"10 Digit HTS CODE":"${htsDigits || '0102390054'}","Country of Origin ":"${formData.countryOfOrigin}","Date Of entry":"${formData.dateOfEntry || '2025-01-01'}","Shipment value":${Number(formData.shipmentValue) || 1000}}]'`;
+
+    console.table(out);
+    setDiag(out);
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* Fullscreen calculating overlay */}
+      {isSubmitting && (
+        <div className="fixed inset-0 z-50 bg-white/80 backdrop-blur-sm flex flex-col items-center justify-center">
+          <div className="relative w-32 h-32">
+            <div className="absolute w-6 h-6 rounded-full bg-blue-600 animate-ping"></div>
+            <div className="absolute left-6 top-6 w-20 h-2 rounded-full bg-blue-300 animate-[pulse_1.2s_ease-in-out_infinite]"></div>
+          </div>
+          <div className="w-64 h-2 bg-gray-200 rounded mt-6 overflow-hidden">
+            <div className="h-full w-1/3 bg-blue-600 animate-[progress_1.8s_ease-in-out_infinite]"></div>
+          </div>
+          <p className="mt-4 text-sm text-gray-700">Calculating duties…</p>
+          <style>{`
+            @keyframes progress { 0% { transform: translateX(-100%); } 50% { transform: translateX(20%); } 100% { transform: translateX(120%); } }
+          `}</style>
+        </div>
+      )}
+
+      {/* Header */}
+      <header className="bg-white shadow-sm">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between items-center h-16">
+            <div className="flex items-center">
+              <svg width="140" height="32" viewBox="0 0 140 32" fill="none" aria-label="GoComet" xmlns="http://www.w3.org/2000/svg">
+                <text x="0" y="24" style={{ fontFamily: 'Arial, sans-serif', fontSize: '20px', fontWeight: 'bold' }}>
+                  <tspan fill="#0066FF">GO</tspan>
+                  <tspan fill="#1a2332">COMET</tspan>
+                </text>
+              </svg>
+            </div>
+
+            <nav className="hidden md:flex space-x-8">
+              <button className="text-gray-700 hover:text-gray-900 flex items-center">Platform <IconChevronDown className="ml-1 w-4 h-4" /></button>
+              <button className="text-gray-700 hover:text-gray-900 flex items-center">Solutions <IconChevronDown className="ml-1 w-4 h-4" /></button>
+              <button className="text-gray-700 hover:text-gray-900 flex items-center">Market Intelligence <IconChevronDown className="ml-1 w-4 h-4" /></button>
+              <button className="text-gray-700 hover:text-gray-900 flex items-center">Insights <IconChevronDown className="ml-1 w-4 h-4" /></button>
+              <button className="text-gray-700 hover:text-gray-900 flex items-center">Company <IconChevronDown className="ml-1 w-4 h-4" /></button>
+            </nav>
+
+            <div className="flex items-center space-x-4">
+              <button className="text-blue-600 hover:text-blue-700 font-medium">Sign In</button>
+              <button className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-medium">Get a Demo</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* Hero */}
+      <section className="bg-gradient-to-r from-blue-900 to-blue-700 text-white py-16">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+          <h1 className="text-4xl md:text-5xl font-bold mb-4">US Import Tariff Calculator</h1>
+          <p className="text-lg md:text-xl text-blue-100 max-w-3xl mx-auto">Calculate estimated US import duties by HTS code, country of origin, and entry date—complete with special programs.</p>
+        </div>
+      </section>
+
+      {/* Calculator Form */}
+      <main className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 -mt-8">
+        <div className="bg-white rounded-lg shadow-lg p-8">
+          <form onSubmit={handleSubmit}>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">HTS Code <span className="text-red-500">*</span></label>
+                <input type="text" name="htsCode" value={formData.htsCode} onChange={handleInputChange} placeholder="0102.39.00.54 or 0102390054" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
+                {htsPretty && (<p className="mt-1 text-xs text-gray-500">Normalized: {htsPretty}</p>)}
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Country of Origin <span className="text-red-500">*</span></label>
+                <select name="countryOfOrigin" value={formData.countryOfOrigin} onChange={handleInputChange} className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent appearance-none">
+                  {countries.map((c) => (<option key={c.name} value={c.name}>{c.flag} {c.name}</option>))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Date of Entry <span className="text-red-500">*</span></label>
+                <input type="date" name="dateOfEntry" value={formData.dateOfEntry} onChange={handleInputChange} max={today} className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Shipment Value (USD) <span className="text-red-500">*</span></label>
+                <div className="relative">
+                  <span className="absolute left-4 top-2.5 text-gray-500">$</span>
+                  <input type="number" name="shipmentValue" value={formData.shipmentValue} onChange={handleInputChange} placeholder="1000.00" min="0" step="0.01" className="w-full pl-8 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
+                </div>
+              </div>
+            </div>
+
+            {/* Controls + Actions */}
+            <div className="mt-8 flex flex-col items-center justify-center gap-3">
+              <div className="w-full max-w-2xl grid gap-2">
+                <label className="flex items-center gap-2 text-sm text-gray-700">
+                  <input
+                    type="checkbox"
+                    checked={useProxy}
+                    onChange={(e) => {
+                      const next = e.target.checked;
+                      setUseProxy(next);
+                      const nextEndpoint = next ? DEFAULT_PROXY_ENDPOINT : UPSTREAM_WEBHOOK;
+                      setEndpoint(nextEndpoint);
+                      try { localStorage.setItem('tariff_endpoint', nextEndpoint); } catch (err) {}
+                    }}
+                  />
+                  Use same-origin proxy ({DEFAULT_PROXY_ENDPOINT}) to bypass CORS
+                </label>
+                <div className="text-xs text-gray-500">If disabled, the app calls the upstream webhook directly (requires CORS headers on the upstream).</div>
+                <label className="text-sm text-gray-700">Active Endpoint</label>
+                <input
+                  type="url"
+                  value={endpoint}
+                  onChange={(e) => { setEndpoint(e.target.value); try { localStorage.setItem('tariff_endpoint', e.target.value); } catch (err) {} }}
+                  className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500"
+                  placeholder={useProxy ? DEFAULT_PROXY_ENDPOINT : UPSTREAM_WEBHOOK}
+                />
+              </div>
+
+              <div className="flex items-center gap-3">
+                <button type="submit" disabled={isSubmitting} className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 rounded-lg font-medium text-lg disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center">
+                  {isSubmitting ? (<><IconLoader className="mr-2 h-5 w-5 animate-spin" />Calculating…</>) : ('Calculate Tariff')}
+                </button>
+                <button type="button" onClick={runDiagnostics} className="text-sm text-blue-700 hover:text-blue-800 underline">Debug</button>
+              </div>
+              <label className="mt-2 flex items-center gap-2 text-sm text-gray-600">
+                <input type="checkbox" checked={simpleMode} onChange={(e) => setSimpleMode(e.target.checked)} />
+                Use simple POST (text/plain) to avoid preflight (for direct upstream calls)
+              </label>
+            </div>
+
+            {submitInfo && (<div className="mt-4 text-center text-green-700 text-sm">{submitInfo.message}</div>)}
+            {diag && (
+              <div className="mt-4 p-4 rounded-lg bg-gray-50 border text-sm text-gray-800">
+                <div className="font-semibold mb-2">Debug Output</div>
+                <div className="grid md:grid-cols-2 gap-3">
+                  <div>
+                    <div><span className="font-mono">origin</span>: {diag.origin}</div>
+                    <div><span className="font-mono">url</span>: {diag.url}</div>
+                    <div><span className="font-mono">upstream</span>: {diag.upstream}</div>
+                    <div><span className="font-mono">time</span>: {diag.time}</div>
+                  </div>
+                  <div>
+                    <div><span className="font-mono">GET</span>: {diag.getStatus || diag.getError || '—'} {diag.getACAO ? `(ACAO: ${diag.getACAO})` : ''}</div>
+                    <div><span className="font-mono">POST text/plain</span>: {diag.postSimpleStatus || diag.postSimpleError || '—'} {diag.postSimpleACAO ? `(ACAO: ${diag.postSimpleACAO})` : ''}</div>
+                    <div><span className="font-mono">POST application/json</span>: {diag.postJsonStatus || diag.postJsonError || '—'} {diag.postJsonACAO ? `(ACAO: ${diag.postJsonACAO})` : ''}</div>
+                  </div>
+                </div>
+                <div className="mt-3">
+                  <div className="font-semibold mb-1">cURL (server-side test, bypasses CORS):</div>
+                  <pre className="whitespace-pre-wrap break-all bg-white p-2 rounded border">{diag.curl}</pre>
+                </div>
+              </div>
+            )}
+            {error && (<div className="mt-4 p-4 rounded-lg bg-red-50 text-red-800">{error}</div>)}
+          </form>
+
+          {Array.isArray(results) && results.length > 0 && (() => {
+            const row = results[0] || {};
+            const sections = row['Tariff Section'] || [];
+            const types = row['Tariff Type'] || [];
+            const rates = row['Rate of Duty'] || [];
+            const amounts = row['Tariff Amount'] || [];
+            const finalDesc = (row['Final Description'] && row['Final Description'][0]) || '—';
+
+            const totalRate = rates.map(parsePercent).reduce((a, b) => a + b, 0);
+            const totalDuty = amounts.map(parseMoney).reduce((a, b) => a + b, 0);
+            const shipValNum = Number(formData.shipmentValue || 0);
+
+            return (
+              <section className="mt-10">
+                {/* HTS Classification card */}
+                <div className="bg-white border rounded-lg p-5">
+                  <div className="flex items-center gap-2 text-sm text-gray-600 mb-2">
+                    <span className="inline-flex items-center gap-1"><span className="w-2 h-2 bg-blue-600 inline-block rounded-full"/> HTS Classification</span>
+                  </div>
+                  <div className="text-gray-700 text-sm">{finalDesc}</div>
+
+                  {/* Summary tiles */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-6">
+                    <div className="border rounded-lg p-4 bg-gray-50">
+                      <div className="text-sm text-gray-500">Total Estimated Rate</div>
+                      <div className="text-2xl font-semibold">{fmtPct(totalRate)}</div>
+                    </div>
+                    <div className="border rounded-lg p-4 bg-gray-50">
+                      <div className="text-sm text-gray-500">Total Estimated Duty</div>
+                      <div className="text-2xl font-semibold">{fmtUSD(totalDuty)}</div>
+                    </div>
+                    <div className="border rounded-lg p-4 bg-gray-50">
+                      <div className="text-sm text-gray-500">Shipment value</div>
+                      <div className="text-2xl font-semibold">{fmtUSD(shipValNum)}</div>
+                    </div>
+                  </div>
+
+                  {/* Detailed Breakdown */}
+                  <div className="mt-6">
+                    <div className="flex items-center gap-2 text-sm text-gray-700 mb-2">
+                      <span className="inline-flex items-center gap-1"><span className="w-3 h-3 inline-block border rounded"/> Detailed Tariff Breakdown</span>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full text-sm border">
+                        <thead className="bg-blue-50">
+                          <tr className="text-left text-gray-700">
+                            <th className="p-2 border">TARIFF SELECTION</th>
+                            <th className="p-2 border">TARIFF TYPE</th>
+                            <th className="p-2 border">RATE</th>
+                            <th className="p-2 border">EFFECTIVE RATE</th>
+                            <th className="p-2 border">DUTY</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sections.map((sec, i) => (
+                            <tr key={`${sec}-${i}`} className="border-t">
+                              <td className="p-2 border align-top">{sec || '—'}</td>
+                              <td className="p-2 border align-top">{types[i] || '—'}</td>
+                              <td className="p-2 border align-top">{rates[i] || '—'}</td>
+                              <td className="p-2 border align-top">{fmtPct(parsePercent(rates[i]))}</td>
+                              <td className="p-2 border align-top">{amounts[i] || '—'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            );
+          })()}
+        </div>
+      </main>
+
+      {/* FAQs */}
+      <section className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
+        <h2 className="text-3xl font-bold text-gray-900 mb-8">FAQs</h2>
+        <div className="w-16 h-1 bg-blue-600 mb-8" />
+        <div className="space-y-4">
+          {faqs.map((faq, index) => (
+            <div key={index} className="bg-white rounded-lg shadow">
+              <button onClick={() => setOpenFaq(openFaq === index ? null : index)} className="w-full px-6 py-4 text-left flex justify-between items-center hover:bg-gray-50" aria-expanded={openFaq === index}>
+                <span className="font-medium text-gray-900">{faq.question}</span>
+                <IconChevronDown className={`w-5 h-5 text-gray-500 transition-transform ${openFaq === index ? 'rotate-180' : ''}`} />
+              </button>
+              {openFaq === index && (<div className="px-6 pb-4 text-gray-600">{faq.answer}</div>)}
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
